@@ -16,8 +16,10 @@ class PriceScraper:
                     return float(nxt)
         return None
 
-    async def search_top_10(self, page, query, url):
-        await page.goto(url, wait_until="domcontentloaded")
+    async def search_top_10(self, page, query):
+        base_url = "https://www.lazada.sg"
+
+        await page.goto(base_url, wait_until="domcontentloaded")
         await asyncio.sleep(5)
 
         await page.locator("input[type='search']").fill(query)
@@ -32,23 +34,24 @@ class PriceScraper:
         for i in range(min(10, count)):
             href = await product_cards.nth(i).locator("a").first.get_attribute("href")
             if href:
-                urls.append(url + href)
+                if href.startswith("http"):
+                    urls.append(href)
+                else:
+                    urls.append(base_url + href)
 
         return urls
 
     async def scrape_product(self, context, url):
         page = await context.new_page()
 
-        await page.goto(url, wait_until="networkidle")
+        await page.goto(url, wait_until="domcontentloaded")
         await asyncio.sleep(3)
 
-        # Force lazy rendering
         await page.mouse.wheel(0, 3000)
         await page.wait_for_timeout(2000)
 
         name = (await page.title()).split("|")[0].strip()
 
-        # Auto-select first SKU if exists
         variants = page.locator(".sku-property-text")
         if await variants.count() > 0:
             await variants.first.click()
@@ -89,18 +92,14 @@ class PriceScraper:
                     data = await self.scrape_product(context, url)
                     results.append(data)
                 except Exception as e:
-                    results.append({
-                        "url": url,
-                        "error": str(e)
-                    })
+                    results.append({"url": url, "error": str(e)})
 
             await browser.close()
             return results
 
 
 if __name__ == "__main__":
-    url = "https://www.lazada.sg"
     scraper = PriceScraper()
-    results = asyncio.run(scraper.search_and_scrape_top_10("whey protein"))
+    results = asyncio.run(scraper.search_and_scrape_top_10("logitech mechanical keyboard"))
     for r in results:
         print(r)
