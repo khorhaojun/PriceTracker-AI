@@ -4,94 +4,103 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 class PriceScraper:
-    async def get_page_data(self, url: str):
+
+    def get_first_price(self, price_list):
+        for i, item in enumerate(price_list):
+            item = item.strip()
+            if re.fullmatch(r"\$\d+\.\d{2}", item):
+                return float(item[1:])
+            if item == "$" and i + 1 < len(price_list):
+                nxt = price_list[i + 1].strip()
+                if re.fullmatch(r"\d+\.\d{2}", nxt):
+                    return float(nxt)
+        return None
+
+    async def search_top_10(self, page, query, url):
+        await page.goto(url, wait_until="domcontentloaded")
+        await asyncio.sleep(5)
+
+        await page.locator("input[type='search']").fill(query)
+        await page.keyboard.press("Enter")
+
+        await page.wait_for_selector("[data-qa-locator='product-item']", timeout=30000)
+
+        product_cards = page.locator("[data-qa-locator='product-item']")
+        count = await product_cards.count()
+
+        urls = []
+        for i in range(min(10, count)):
+            href = await product_cards.nth(i).locator("a").first.get_attribute("href")
+            if href:
+                urls.append(url + href)
+
+        return urls
+
+    async def scrape_product(self, context, url):
+        page = await context.new_page()
+
+        await page.goto(url, wait_until="networkidle")
+        await asyncio.sleep(3)
+
+        # Force lazy rendering
+        await page.mouse.wheel(0, 3000)
+        await page.wait_for_timeout(2000)
+
+        name = (await page.title()).split("|")[0].strip()
+
+        # Auto-select first SKU if exists
+        variants = page.locator(".sku-property-text")
+        if await variants.count() > 0:
+            await variants.first.click()
+            await asyncio.sleep(2)
+
+        try:
+            await page.wait_for_selector(
+                ".pdp-mod-product-info span[class*='price']",
+                timeout=15000
+            )
+            price_locator = page.locator(".pdp-mod-product-info span[class*='price']")
+        except:
+            await page.wait_for_selector("span[class*='price']", timeout=15000)
+            price_locator = page.locator("span[class*='price']")
+
+        price_parts = await price_locator.all_inner_texts()
+        price = self.get_first_price(price_parts)
+
+        await page.close()
+
+        return {
+            "name": name,
+            "price": price,
+            "url": url
+        }
+
+    async def search_and_scrape_top_10(self, query):
         async with Stealth().use_async(async_playwright()) as p:
-            # We use a real browser window so you can solve any captcha that appears
-            browser = await p.chromium.launch(headless=False) 
+            browser = await p.chromium.launch(headless=False)
             context = await browser.new_context()
             page = await context.new_page()
 
-            print(f"🔍 Accessing: {url}")
-            try:
-                await page.goto(url, wait_until="load")
-                
-                # Give the page 10 seconds. If a captcha appears, SOLVE IT MANUALLY.
-                print("⏳ Human Check: If you see a slider, solve it in the browser window now...")
-                await asyncio.sleep(10) 
+            urls = await self.search_top_10(page, query)
 
-                # AGNOSTIC EXTRACTION:
-                # 1. Get the Page Title (Usually the <h1> or the largest meta title)
-                name = await page.title()
-                # Clean Shopee's suffix from title
-                name = name.split("|")[0].strip()
+            results = []
+            for url in urls:
+                try:
+                    data = await self.scrape_product(context, url)
+                    results.append(data)
+                except Exception as e:
+                    results.append({
+                        "url": url,
+                        "error": str(e)
+                    })
 
-                # 2. Find the Price by looking for the '$' character and surrounding numbers
-                # We evaluate this inside the browser to find the most likely price element
+            await browser.close()
+            return results
 
-                price_candidates = await page.evaluate("""
-                () => {
-                    const priceRegex = /\\$\\d+(?:\\.\\d{2})?/g;
-                    const results = [];
-
-                    document.querySelectorAll('span, div').forEach(el => {
-                        if (!el.innerText) return;
-                        if (el.innerText.length > 60) return; // 🚫 skip large blocks
-
-                        const matches = el.innerText.match(priceRegex);
-                        if (!matches) return;
-
-                        const style = window.getComputedStyle(el);
-
-                        matches.forEach(price => {
-                            results.push({
-                                price,
-                                fontSize: parseFloat(style.fontSize),
-                                isStriked: style.textDecoration.includes('line-through'),
-                                color: style.color,
-                                textContext: el.innerText
-                            });
-                        });
-                    });
-
-                    return results;
-                }
-                """)
-
-                def get_product_price_only(candidates):
-                    """
-                    candidates: The list of objects you got (price, fontSize, textContext, etc.)
-                    """
-                    # 1. Filter out known 'Shipping' or 'Voucher' keywords using regex
-                    # This specifically removes the $60.00 and $5.99 delivery fees
-                    filtered = [
-                        item for item in candidates 
-                        if not re.search(r'delivery|spend|min\.|slot|express', item['textContext'], re.IGNORECASE)
-                        and not item.get('isStriked', False) and not item.get('fontSize') == 13
-                    ]
-
-                    if not filtered:
-                        return None
-
-                    # 2. Pick the item with the LARGEST font size
-                    # On Lazada/Shopee, the product price ($7.50) is visually the biggest element
-                    main_item = max(filtered, key=lambda x: x['fontSize'])
-                    
-                    # 3. Final Regex: Extract only the decimal number from the winning string
-                    # Matches: 7.50 from "$7.50" or "SGD 7.50"
-                    price_match = re.search(r"(\d+\.\d{2})", main_item['price'])
-                    return float(price_match.group(1)) if price_match else None
-                
-                best_price = get_product_price_only(price_candidates)
-
-                return best_price
-
-
-            except Exception as e:
-                return {"error": f"Extraction failed: {str(e)}"}
-            finally:
-                await browser.close()
 
 if __name__ == "__main__":
+    url = "https://www.lazada.sg"
     scraper = PriceScraper()
-    url = "https://www.lazada.sg/products/pdp-i301072965-s527094858.html?scm=1007.17760.398138.0&pvid=d9bfb37c-7bba-4f2f-a3db-f159b313ea3b&search=flashsale&spm=a2o42.homepage.FlashSale.d_301072965"
-    print(asyncio.run(scraper.get_page_data(url)))
+    results = asyncio.run(scraper.search_and_scrape_top_10("whey protein"))
+    for r in results:
+        print(r)
